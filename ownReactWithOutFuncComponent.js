@@ -44,7 +44,11 @@
       ? document.createTextNode("")
       : document.createElement(fiber.type);
 
-    updateDom(dom, {}, fiber.props);
+    // assign element props to dom
+    Object
+      .keys(fiber.props)
+      .filter(isProperty)
+      .forEach(name => (dom[name] = fiber.props[name]));
 
     return dom;
   };
@@ -93,38 +97,26 @@
   function commitRoot() {
     // delete fiber before commit wipRoot
     deletions.push(commitWork);
-    console.log(`🚀 ~ commitRoot ~ wipRoot:`, wipRoot);
     commitWork(wipRoot.child);
     currentRoot = wipRoot;
     wipRoot = null;
   };
   function commitWork(fiber) {
     if (!fiber) return;
-
-    // function component 沒有 dom,
-    // 因此需要再往上找到 function component 的 parentFiber dom
-    let parentFiber = fiber.parent
-    while (!parentFiber.dom) {
-      parentFiber = parentFiber.parent;
-    }
-
-    if (fiber.effectTag === EFFECT_TAGS.PLACEMENT && fiber.dom != null) {
-      parentFiber.dom.appendChild(fiber.dom);
-    } else if (fiber.effectTag === EFFECT_TAGS.UPDATE && fiber.dom != null) {
+    if (
+      fiber.effectTag === EFFECT_TAGS.PLACEMENT && fiber.dom != null
+    ) {
+      fiber.parent.dom.appendChild(fiber.dom);
+    } else if (
+      fiber.effectTag === EFFECT_TAGS.UPDATE && fiber.dom != null
+    ) {
       updateDom(fiber.dom, fiber.alternate.props, fiber.props);
     } else if (fiber.effectTag === EFFECT_TAGS.DELETION) {
-      commitDeletion(fiber, parentFiber.dom);
+      fiber.parent.dom.removeChild(fiber.dom);
     }
     commitWork(fiber.child);
     commitWork(fiber.sibling);
   };
-  function commitDeletion(fiber, domParent) {
-    if (fiber.dom) {
-      domParent.removeChild(fiber.dom)
-    } else {
-      commitDeletion(fiber.child, domParent)
-    }
-  }
   // Render
   /**
    * We are going to break the work into small units, 
@@ -153,12 +145,14 @@
   requestIdleCallback(workLoop);
   function performUnitOfWork(fiber) {
     console.log('performUnitOfWork', '\r\n');
-    const isFunctionComponent = fiber.type instanceof Function;
-    if (isFunctionComponent) {
-      updateFunctionComponent(fiber);
-    } else {
-      updateHostComponent(fiber);
+    // add dom node
+    if (!fiber.dom) {
+      fiber.dom = createDom(fiber);
     }
+
+    // reconcile fibers from elements that was created by createElement
+    const elements = fiber.props.children;
+    reconcileChildren(fiber, elements);
 
     /**
      * return next unit of work(以 BFS 的方式)
@@ -192,9 +186,9 @@
    *   We iterate at the same time over the children of the old fiber (wipFiber.alternate) and the array of elements we want to reconcile.
    *   
    */
-  function reconcileChildren(fiber, elements) {
+  function reconcileChildren(wipFiber, elements) {
     let index = 0, prevSibling = null;
-    let oldFiber = fiber.alternate && fiber.alternate.child;
+    let oldFiber = wipFiber.alternate && wipFiber.alternate.child;
 
     while (index < elements.length || oldFiber != null) {
       let elementFiber = null;
@@ -208,7 +202,7 @@
           type: oldFiber.type,
           props: element.props,
           dom: oldFiber.dom,
-          parent: fiber,
+          parent: wipFiber,
           alternate: oldFiber,
           effectTag: EFFECT_TAGS.UPDATE,
         }
@@ -220,7 +214,7 @@
           type: element.type,
           props: element.props,
           dom: null,
-          parent: fiber,
+          parent: wipFiber,
           alternate: null,
           effectTag: EFFECT_TAGS.PLACEMENT,
         }
@@ -235,7 +229,7 @@
         deletions.push(oldFiber);
       }
 
-      // elements[0] 對應 oldFiber(fiber.alternate.child)
+      // elements[0] 對應 oldFiber(wipFiber.alternate.child)
       // elements[1..n] 作前一個的 sibling 不斷 iterator
       // 因此 oldFiber 也要換成下一個 sibling 對應到下一個 element
       if (oldFiber) {
@@ -244,7 +238,7 @@
 
       // 第一個 elementFiber 作為 child
       if (index === 0) {
-        fiber.child = elementFiber;
+        wipFiber.child = elementFiber;
       } else if (element) {
         // 後續同階級的 elementFiber, 作為前一個 elementFiber 的 sibling
         prevSibling.sibling = elementFiber;
@@ -253,22 +247,6 @@
       index++;
     }
   }
-  let wipFiber = null;
-  let hookIndex = null;
-  function updateFunctionComponent(fiber) {
-    wipFiber = fiber;
-    hookIndex = 0;
-    wipFiber.hooks = [];
-    reconcileChildren(fiber, [fiber.type(fiber.props)]);
-  };
-  function updateHostComponent(fiber) {
-    // add dom node
-    if (!fiber.dom) {
-      fiber.dom = createDom(fiber);
-    }
-    // reconcile fibers from elements that was created by createElement
-    reconcileChildren(fiber, fiber.props.children);
-  };
   function render(element, container) {
     console.log('render', '\r\n');
     // A pointer for track workInProgress root fiber
@@ -286,80 +264,23 @@
     nextUnitOfWork = wipRoot;
   }
 
-  // Hooks
-  function useState(initial) {
-    const oldHook =
-      wipFiber.alternate &&
-      wipFiber.alternate.hooks &&
-      wipFiber.alternate.hooks[hookIndex];
-    const hook = {
-      state: oldHook ?
-        oldHook.state :
-        initial instanceof Function ? initial() : initial,
-      queue: [],
-    }
-
-    /**
-     * We do it the next time we are rendering the component, 
-     * we get all the actions from the old hook queue, 
-     * and then apply them one by one to the new hook state, 
-     * so when we return the state it’s updated.
-    */
-    const actions = oldHook ? oldHook.queue : [];
-    actions.forEach(action => {
-      // useState setFunction 會接收到最新的 state 的原因
-      hook.state = action(hook.state);
-    });
-
-    const setState = action => {
-      // We push that action to a queue we added to the hook.
-      // batch action...?
-      hook.queue.push(action);
-      /**
-       * And then we do something similar to what we did in the render
-       * function, 
-       * set a new wipRoot(work in progress root) as the next unit of work,
-       * so the workLoop can start a new render phase.
-      */
-      wipRoot = {
-        dom: currentRoot.dom,
-        props: currentRoot.props,
-        alternate: currentRoot,
-      }
-      nextUnitOfWork = wipRoot;
-      deletions = [];
-    };
-
-    wipFiber.hooks.push(hook);
-    hookIndex++;
-    return [hook.state, setState];
-  }
-
-  window.Dai = { createElement, render, useState };
+  window.Dai = { createElement, render };
 
   /**
-    function App(props) {
-      return Dai.createElement(
-        "h1",
-        null,
-        "Hi ",
-        props.name
-      )
-    }
-    const element = Dai.createElement(App, {
-      name: "foo",
-    })
+   const element = Dai.createElement(
+      "div",
+      { id: "foo" },
+      Dai.createElement("div", null, "bar"),
+      Dai.createElement("div")
+    )
   */
   /** @jsx Dai.createElement */
-  function Counter() {
-    const [state, setState] = Dai.useState(()=> 123);
-    return (
-      <h1 onClick={() => setState(c => c + 1)}>
-        Count: {state}
-      </h1>
-    )
-  }
-  const element = <Counter />
+  const element = (
+    <div id="foo">
+      <div>bar</div>
+      <div />
+    </div>
+  )
   Dai.render(element, document.getElementById("root"));
 })();
 
